@@ -49,24 +49,23 @@ class Pkcs11Config:
 
     @classmethod
     def current(cls) -> "Pkcs11Config":
-        module = config_value("pkcs11_module", "ESIG_PKCS11_MODULE")
-        cert_label = config_value("cert_label", "ESIG_PKCS11_CERT_LABEL")
+        module = CONFIG.get("pkcs11_module")
+        cert_label = CONFIG.get("cert_label")
         if not module:
             raise ValueError("pkcs11_module is required in config.json")
 
-        slot_no_raw = config_value("slot_no", "ESIG_PKCS11_SLOT_NO")
+        slot_no_raw = CONFIG.get("slot_no")
         slot_no = int(slot_no_raw) if slot_no_raw else None
-        key_id_raw = config_value("key_id", "ESIG_PKCS11_KEY_ID")
+        key_id_raw = CONFIG.get("key_id")
         key_id = bytes.fromhex(key_id_raw.replace(":", "")) if key_id_raw else None
 
         return cls(
             module=module,
             cert_label=cert_label,
-            token_label=config_value("token_label", "ESIG_PKCS11_TOKEN_LABEL"),
-            key_label=config_value("key_label", "ESIG_PKCS11_KEY_LABEL"),
+            token_label=CONFIG.get("token_label"),
+            key_label=CONFIG.get("key_label"),
             key_id=key_id,
             slot_no=slot_no,
-            pin=os.environ.get("ESIG_PKCS11_PIN"),
         )
 
 
@@ -123,19 +122,13 @@ def save_config(config: dict[str, Any]) -> None:
     )
 
 
-def config_value(config_key: str, env_key: str) -> Any:
-    if env_key in os.environ:
-        return os.environ[env_key]
-    return CONFIG.get(config_key)
-
-
 def configure_interactively() -> None:
     global CONFIG
 
     CONFIG = load_config()
     log(f"Loaded configuration from {CONFIG_PATH}" if CONFIG else f"No {CONFIG_PATH} found")
-    while not module_loads(config_value("pkcs11_module", "ESIG_PKCS11_MODULE")):
-        current = config_value("pkcs11_module", "ESIG_PKCS11_MODULE")
+    while not module_loads(CONFIG.get("pkcs11_module")):
+        current = CONFIG.get("pkcs11_module")
         if current:
             print(f"Cannot load configured PKCS#11 module: {current}", file=sys.stderr)
         module = input("PKCS#11 module path: ").strip()
@@ -151,10 +144,8 @@ def configure_interactively() -> None:
         raise RuntimeError("No PKCS#11 certificates found")
 
     selected = select_certificate(certs)
-    if "ESIG_PKCS11_CERT_LABEL" not in os.environ:
-        CONFIG["cert_label"] = selected.get("label") or None
-    if "ESIG_PKCS11_KEY_ID" not in os.environ:
-        CONFIG["key_id"] = selected.get("id") or None
+    CONFIG["cert_label"] = selected.get("label") or None
+    CONFIG["key_id"] = selected.get("id") or None
     CONFIG = {key: value for key, value in CONFIG.items() if value is not None}
     save_config(CONFIG)
     log(f"Using certificate label={CONFIG.get('cert_label')} key_id={CONFIG.get('key_id')}")
@@ -173,8 +164,8 @@ def module_loads(module: Any) -> bool:
 
 
 def select_certificate(certs: list[dict[str, Any]]) -> dict[str, Any]:
-    configured_label = config_value("cert_label", "ESIG_PKCS11_CERT_LABEL")
-    configured_id = config_value("key_id", "ESIG_PKCS11_KEY_ID")
+    configured_label = CONFIG.get("cert_label")
+    configured_id = CONFIG.get("key_id")
     for cert in certs:
         if configured_id and cert.get("id") == configured_id:
             return cert
@@ -295,7 +286,7 @@ def sign() -> tuple[Response, int] | Response:
 
 @app.route("/debug/pkcs11", methods=["GET"])
 def debug_pkcs11() -> tuple[Response, int]:
-    if os.environ.get("ESIG_ENABLE_DEBUG_ENDPOINTS") != "1":
+    if not config_bool("enable_debug_endpoints", default=False):
         return execution_error("Debug endpoints are disabled", status=404, code="NotFound")
     try:
         return execution_ok({"objects": list_pkcs11_objects()})
@@ -421,7 +412,7 @@ def sign_pdf_with_pkcs11(payload: dict[str, Any]) -> bytes:
     cfg = Pkcs11Config.current()
     pdf_bytes = base64.b64decode(payload["fileBase64Format"], validate=True)
     digest = SUPPORTED_DIGESTS[payload["digestAlgorithm"].upper()]
-    field_name = os.environ.get("ESIG_PDF_FIELD_NAME", "Signature1")
+    field_name = CONFIG.get("pdf_field_name", "Signature1")
     log(f"Preparing pyHanko signer digest={digest} field={field_name}")
 
     user_pin = cfg.pin
@@ -701,10 +692,10 @@ def describe_certificate(cert_der: bytes) -> dict[str, str]:
 if __name__ == "__main__":
     configure_interactively()
 
-    if len(os.sys.argv) > 1 and os.sys.argv[1] == "list-pkcs11":
+    if len(sys.argv) > 1 and sys.argv[1] == "list-pkcs11":
         print(json.dumps(list_pkcs11_objects(), indent=2, ensure_ascii=False))
         raise SystemExit(0)
 
-    host = os.environ.get("ESIG_HOST", "127.0.0.1")
-    port = int(os.environ.get("ESIG_PORT", "9795"))
+    host = CONFIG.get("host", "127.0.0.1")
+    port = int(CONFIG.get("port", 9795))
     app.run(host=host, port=port)
