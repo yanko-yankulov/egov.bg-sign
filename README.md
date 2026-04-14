@@ -43,6 +43,8 @@ Example:
   "pkcs11_module": "/usr/lib/pkcs11/opensc-pkcs11.so",
   "cert_label": "SIGNING CERTIFICATE LABEL",
   "key_id": "0123456789abcdef"
+  "preview_pdf_before_sign": true,
+  "pdf_viewer_command": "xdg-open"
 }
 ```
 
@@ -62,6 +64,11 @@ ESIG_PKCS11_PIN
 
 Do not put the PIN in `config.json`. If `ESIG_PKCS11_PIN` is unset, the service
 prompts for the PIN on the console for each signing request.
+
+For `/rest/signDoc`, `preview_pdf_before_sign` opens the uploaded PDF before
+the PIN prompt and waits for console confirmation. If `pdf_viewer_command` is
+missing, the service uses `xdg-open` on Linux, `open` on macOS, or the default
+file handler on Windows.
 
 Server:
 
@@ -110,4 +117,6 @@ This is intentionally narrower than the Java fork:
 - No XAdES, CAdES, ASiC, timestamps, LT/LTA, or visible signature placement.
 - No UI for token/certificate selection.
 - PIN is read from environment for now.
+- The stock `/rest/sign` flow cannot preview the PDF because the caller only
+  sends the prepared bytes-to-sign to the local service.
 - Only localhost should be used; do not expose this service on a network.

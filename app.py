@@ -5,7 +5,11 @@ import getpass
 import io
 import json
 import os
+import shlex
+import subprocess
 import sys
+import tempfile
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +94,15 @@ def execution_error(message: str, status: int = 500, code: str = "Exception") ->
     ), status
 
 
+def log(message: str) -> None:
+    print(f"[nexu-python] {message}", flush=True)
+
+
+def log_exception(context: str, exc: Exception) -> None:
+    log(f"{context} failed: {exc}")
+    traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         return {}
@@ -120,6 +133,7 @@ def configure_interactively() -> None:
     global CONFIG
 
     CONFIG = load_config()
+    log(f"Loaded configuration from {CONFIG_PATH}" if CONFIG else f"No {CONFIG_PATH} found")
     while not module_loads(config_value("pkcs11_module", "ESIG_PKCS11_MODULE")):
         current = config_value("pkcs11_module", "ESIG_PKCS11_MODULE")
         if current:
@@ -129,8 +143,10 @@ def configure_interactively() -> None:
             continue
         CONFIG["pkcs11_module"] = module
         save_config(CONFIG)
+        log(f"Saved PKCS#11 module to {CONFIG_PATH}")
 
     certs = list_pkcs11_certificates()
+    log(f"Found {len(certs)} certificate(s) on token")
     if not certs:
         raise RuntimeError("No PKCS#11 certificates found")
 
@@ -141,6 +157,7 @@ def configure_interactively() -> None:
         CONFIG["key_id"] = selected.get("id") or None
     CONFIG = {key: value for key, value in CONFIG.items() if value is not None}
     save_config(CONFIG)
+    log(f"Using certificate label={CONFIG.get('cert_label')} key_id={CONFIG.get('key_id')}")
 
 
 def module_loads(module: Any) -> bool:
@@ -220,9 +237,15 @@ def sign_doc() -> tuple[Response, int] | Response:
         return Response(status=200)
 
     try:
+        log("POST /rest/signDoc received")
         payload = request.get_json(force=True)
+        log(f"signDoc file={payload.get('fileName')} format={payload.get('signatureFormat')} level={payload.get('signatureLevel')}")
         validate_request(payload)
+        log("signDoc request validated")
+        preview_pdf_before_sign(payload)
+        log("PDF preview accepted")
         signed_pdf = sign_pdf_with_pkcs11(payload)
+        log(f"PDF signed, output bytes={len(signed_pdf)}")
         signed_name = signed_file_name(payload["fileName"])
         return execution_ok(
             {
@@ -234,6 +257,7 @@ def sign_doc() -> tuple[Response, int] | Response:
             }
         )
     except Exception as exc:
+        log_exception("POST /rest/signDoc", exc)
         return execution_error(str(exc))
 
 
@@ -243,9 +267,12 @@ def certificates() -> tuple[Response, int] | Response:
         return Response(status=200)
 
     try:
+        log("POST /rest/certificates received")
         cert_info = get_certificate_info()
+        log(f"Returning certificate keyId={cert_info.get('keyId')}")
         return execution_ok(cert_info)
     except Exception as exc:
+        log_exception("POST /rest/certificates", exc)
         return execution_error(str(exc))
 
 
@@ -255,10 +282,14 @@ def sign() -> tuple[Response, int] | Response:
         return Response(status=200)
 
     try:
+        log("POST /rest/sign received")
         payload = request.get_json(force=True, silent=True) or {}
+        log(f"Signing toBeSigned digest={payload.get('digestAlgorithm') or 'SHA256'}")
         signature_info = sign_to_be_signed(payload)
+        log(f"Signature produced, bytes={len(base64.b64decode(signature_info['signatureValue']))}")
         return execution_ok(signature_info)
     except Exception as exc:
+        log_exception("POST /rest/sign", exc)
         return execution_error(str(exc))
 
 
@@ -296,8 +327,9 @@ def validate_request(payload: Any) -> None:
     if packaging != "enveloped":
         raise ValueError("Only enveloped PDF signatures are supported")
 
-    level = payload["signatureLevel"].upper()
-    if level not in {"PADES-BASELINE-B", "PADES_BASELINE_B"}:
+    level = normalize_signature_level(payload["signatureLevel"], signature_format)
+    payload["signatureLevel"] = level
+    if level != "PADES-BASELINE-B":
         raise ValueError("Only PAdES baseline-B is supported")
 
     digest = payload["digestAlgorithm"].upper()
@@ -307,6 +339,71 @@ def validate_request(payload: Any) -> None:
     file_bytes = base64.b64decode(payload["fileBase64Format"], validate=True)
     if not file_bytes.startswith(b"%PDF-"):
         raise ValueError("Only PDF input is supported")
+
+
+def normalize_signature_level(level: str, signature_format: str) -> str:
+    normalized = level.strip().upper().replace("_", "-")
+    if normalized == "BASELINE-B":
+        return f"{signature_format.upper()}-BASELINE-B"
+    return normalized
+
+
+def preview_pdf_before_sign(payload: dict[str, Any]) -> None:
+    if not config_bool("preview_pdf_before_sign", default=True):
+        log("PDF preview disabled by config")
+        return
+
+    pdf_bytes = base64.b64decode(payload["fileBase64Format"], validate=True)
+    preview_path = write_preview_pdf(pdf_bytes, payload["fileName"])
+    log(f"Wrote PDF preview to {preview_path}")
+    open_preview_file(preview_path)
+
+    print(f"Review PDF before signing: {preview_path}")
+    answer = input("Press Enter to sign, or type 'cancel' to abort: ").strip().lower()
+    if answer in {"c", "cancel", "abort", "no", "n"}:
+        raise ValueError("Signing cancelled before PIN entry")
+
+
+def config_bool(config_key: str, default: bool) -> bool:
+    value = CONFIG.get(config_key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def write_preview_pdf(pdf_bytes: bytes, original_name: str) -> Path:
+    suffix = ".pdf"
+    if original_name.lower().endswith(".pdf"):
+        suffix = "-" + Path(original_name).name
+    with tempfile.NamedTemporaryFile(
+        prefix="nexu-sign-preview-",
+        suffix=suffix,
+        delete=False,
+    ) as preview_file:
+        preview_file.write(pdf_bytes)
+        return Path(preview_file.name)
+
+
+def open_preview_file(path: Path) -> None:
+    command = CONFIG.get("pdf_viewer_command")
+    try:
+        if command:
+            log(f"Opening PDF with configured command: {command}")
+            subprocess.Popen([*shlex.split(str(command)), str(path)])
+        elif sys.platform == "darwin":
+            log("Opening PDF with open")
+            subprocess.Popen(["open", str(path)])
+        elif os.name == "nt":
+            log("Opening PDF with default Windows handler")
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            log("Opening PDF with xdg-open")
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:
+        print(f"Could not open PDF viewer automatically: {exc}", file=sys.stderr)
+        print(f"Open this file manually before continuing: {path}", file=sys.stderr)
 
 
 def sign_pdf_with_pkcs11(payload: dict[str, Any]) -> bytes:
@@ -325,11 +422,14 @@ def sign_pdf_with_pkcs11(payload: dict[str, Any]) -> bytes:
     pdf_bytes = base64.b64decode(payload["fileBase64Format"], validate=True)
     digest = SUPPORTED_DIGESTS[payload["digestAlgorithm"].upper()]
     field_name = os.environ.get("ESIG_PDF_FIELD_NAME", "Signature1")
+    log(f"Preparing pyHanko signer digest={digest} field={field_name}")
 
     user_pin = cfg.pin
     if user_pin is None:
+        log("Requesting PIN for PDF signature")
         user_pin = getpass.getpass("PIN for PKCS#11 signature: ")
 
+    log("Opening PKCS#11 session for PDF signature")
     session = open_pkcs11_session(
         lib_location=cfg.module,
         slot_no=cfg.slot_no,
@@ -353,6 +453,7 @@ def sign_pdf_with_pkcs11(payload: dict[str, Any]) -> bytes:
         )
         writer = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
         output = io.BytesIO()
+        log("Calling pyHanko PdfSigner.sign_pdf")
         signers.PdfSigner(metadata, signer=pkcs11_signer).sign_pdf(writer, output=output)
         return output.getvalue()
     finally:
@@ -369,6 +470,7 @@ def signed_file_name(file_name: str) -> str:
 
 
 def get_certificate_info() -> dict[str, Any]:
+    log("Reading configured certificate from token")
     cert_der = read_pkcs11_certificate()
     encryption_algorithm = certificate_encryption_algorithm(cert_der)
     key_id = configured_key_id()
@@ -425,6 +527,7 @@ def read_pkcs11_certificate() -> bytes:
 def pkcs11_sign(data: bytes, digest_algorithm: str) -> bytes:
     cfg = Pkcs11Config.current()
     mechanism_name = PKCS11_RSA_MECHANISMS[digest_algorithm]
+    log(f"Opening PKCS#11 session for raw signature, bytes={len(data)} mechanism={mechanism_name}")
     with open_token_session(require_login=True) as session:
         key = get_pkcs11_object(
             session,
@@ -432,7 +535,9 @@ def pkcs11_sign(data: bytes, digest_algorithm: str) -> bytes:
             label=cfg.key_label,
             object_id=cfg.key_id,
         )
-        return bytes(key.sign(data, mechanism=pkcs11_mechanism(mechanism_name)))
+        signature = bytes(key.sign(data, mechanism=pkcs11_mechanism(mechanism_name)))
+        log(f"Raw PKCS#11 signature completed, bytes={len(signature)}")
+        return signature
 
 
 def open_token_session(require_login: bool = False):

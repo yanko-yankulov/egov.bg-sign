@@ -2,4 +2,6 @@
   "pkcs11_module": "/usr/lib/pkcs11/opensc-pkcs11.so",
   "cert_label": "SIGNING CERTIFICATE LABEL",
   "key_id": "0123456789abcdef"
+  "preview_pdf_before_sign": true,
+  "pdf_viewer_command": "evince"
 }
