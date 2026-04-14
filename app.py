@@ -3,8 +3,11 @@ from __future__ import annotations
 import base64
 import getpass
 import io
+import json
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, request
@@ -24,6 +27,8 @@ PKCS11_RSA_MECHANISMS = {
     "SHA512": "SHA512_RSA_PKCS",
 }
 TOKEN_ID = "configured-pkcs11-token"
+CONFIG_PATH = Path("config.json")
+CONFIG: dict[str, Any] = {}
 
 app = Flask(__name__)
 
@@ -39,22 +44,22 @@ class Pkcs11Config:
     pin: str | None = None
 
     @classmethod
-    def from_env(cls) -> "Pkcs11Config":
-        module = os.environ.get("ESIG_PKCS11_MODULE")
-        cert_label = os.environ.get("ESIG_PKCS11_CERT_LABEL")
+    def current(cls) -> "Pkcs11Config":
+        module = config_value("pkcs11_module", "ESIG_PKCS11_MODULE")
+        cert_label = config_value("cert_label", "ESIG_PKCS11_CERT_LABEL")
         if not module:
-            raise ValueError("ESIG_PKCS11_MODULE is required")
+            raise ValueError("pkcs11_module is required in config.json")
 
-        slot_no_raw = os.environ.get("ESIG_PKCS11_SLOT_NO")
+        slot_no_raw = config_value("slot_no", "ESIG_PKCS11_SLOT_NO")
         slot_no = int(slot_no_raw) if slot_no_raw else None
-        key_id_raw = os.environ.get("ESIG_PKCS11_KEY_ID")
+        key_id_raw = config_value("key_id", "ESIG_PKCS11_KEY_ID")
         key_id = bytes.fromhex(key_id_raw.replace(":", "")) if key_id_raw else None
 
         return cls(
             module=module,
             cert_label=cert_label,
-            token_label=os.environ.get("ESIG_PKCS11_TOKEN_LABEL"),
-            key_label=os.environ.get("ESIG_PKCS11_KEY_LABEL"),
+            token_label=config_value("token_label", "ESIG_PKCS11_TOKEN_LABEL"),
+            key_label=config_value("key_label", "ESIG_PKCS11_KEY_LABEL"),
             key_id=key_id,
             slot_no=slot_no,
             pin=os.environ.get("ESIG_PKCS11_PIN"),
@@ -83,6 +88,113 @@ def execution_error(message: str, status: int = 500, code: str = "Exception") ->
             "feedback": None,
         }
     ), status
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as config_file:
+            data = json.load(config_file)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid {CONFIG_PATH}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{CONFIG_PATH} must contain a JSON object")
+    return data
+
+
+def save_config(config: dict[str, Any]) -> None:
+    CONFIG_PATH.write_text(
+        json.dumps(config, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def config_value(config_key: str, env_key: str) -> Any:
+    if env_key in os.environ:
+        return os.environ[env_key]
+    return CONFIG.get(config_key)
+
+
+def configure_interactively() -> None:
+    global CONFIG
+
+    CONFIG = load_config()
+    while not module_loads(config_value("pkcs11_module", "ESIG_PKCS11_MODULE")):
+        current = config_value("pkcs11_module", "ESIG_PKCS11_MODULE")
+        if current:
+            print(f"Cannot load configured PKCS#11 module: {current}", file=sys.stderr)
+        module = input("PKCS#11 module path: ").strip()
+        if not module:
+            continue
+        CONFIG["pkcs11_module"] = module
+        save_config(CONFIG)
+
+    certs = list_pkcs11_certificates()
+    if not certs:
+        raise RuntimeError("No PKCS#11 certificates found")
+
+    selected = select_certificate(certs)
+    if "ESIG_PKCS11_CERT_LABEL" not in os.environ:
+        CONFIG["cert_label"] = selected.get("label") or None
+    if "ESIG_PKCS11_KEY_ID" not in os.environ:
+        CONFIG["key_id"] = selected.get("id") or None
+    CONFIG = {key: value for key, value in CONFIG.items() if value is not None}
+    save_config(CONFIG)
+
+
+def module_loads(module: Any) -> bool:
+    if not module:
+        return False
+    try:
+        import pkcs11
+
+        pkcs11.lib(str(module))
+        return True
+    except Exception:
+        return False
+
+
+def select_certificate(certs: list[dict[str, Any]]) -> dict[str, Any]:
+    configured_label = config_value("cert_label", "ESIG_PKCS11_CERT_LABEL")
+    configured_id = config_value("key_id", "ESIG_PKCS11_KEY_ID")
+    for cert in certs:
+        if configured_id and cert.get("id") == configured_id:
+            return cert
+        if configured_label and cert.get("label") == configured_label:
+            return cert
+
+    if len(certs) == 1:
+        return certs[0]
+
+    print("Available signing certificates:")
+    for index, cert in enumerate(certs, start=1):
+        label = cert.get("label") or "(no label)"
+        subject = cert.get("subject") or "(unknown subject)"
+        not_after = cert.get("not_after") or "unknown expiry"
+        expired = " expired" if certificate_is_expired(cert) else ""
+        print(f"  {index}. {label}")
+        print(f"     {subject}")
+        print(f"     valid until: {not_after}{expired}")
+
+    while True:
+        choice = input(f"Choose certificate [1-{len(certs)}]: ").strip()
+        try:
+            index = int(choice)
+        except ValueError:
+            continue
+        if 1 <= index <= len(certs):
+            return certs[index - 1]
+
+
+def certificate_is_expired(cert: dict[str, Any]) -> bool:
+    not_after = cert.get("not_after")
+    if not not_after:
+        return False
+    from datetime import datetime
+
+    expires_at = datetime.fromisoformat(not_after)
+    return expires_at <= datetime.now(tz=expires_at.tzinfo)
 
 
 @app.after_request
@@ -209,16 +321,20 @@ def sign_pdf_with_pkcs11(payload: dict[str, Any]) -> bytes:
             "Install dependencies from requirements.txt."
         ) from exc
 
-    cfg = Pkcs11Config.from_env()
+    cfg = Pkcs11Config.current()
     pdf_bytes = base64.b64decode(payload["fileBase64Format"], validate=True)
     digest = SUPPORTED_DIGESTS[payload["digestAlgorithm"].upper()]
     field_name = os.environ.get("ESIG_PDF_FIELD_NAME", "Signature1")
+
+    user_pin = cfg.pin
+    if user_pin is None:
+        user_pin = getpass.getpass("PIN for PKCS#11 signature: ")
 
     session = open_pkcs11_session(
         lib_location=cfg.module,
         slot_no=cfg.slot_no,
         token_label=cfg.token_label,
-        user_pin=cfg.pin,
+        user_pin=user_pin,
     )
     try:
         signer_kwargs = {
@@ -295,7 +411,7 @@ def extract_to_be_signed(payload: dict[str, Any]) -> bytes:
 
 
 def read_pkcs11_certificate() -> bytes:
-    cfg = Pkcs11Config.from_env()
+    cfg = Pkcs11Config.current()
     with open_token_session() as session:
         cert = get_pkcs11_object(
             session,
@@ -307,7 +423,7 @@ def read_pkcs11_certificate() -> bytes:
 
 
 def pkcs11_sign(data: bytes, digest_algorithm: str) -> bytes:
-    cfg = Pkcs11Config.from_env()
+    cfg = Pkcs11Config.current()
     mechanism_name = PKCS11_RSA_MECHANISMS[digest_algorithm]
     with open_token_session(require_login=True) as session:
         key = get_pkcs11_object(
@@ -327,7 +443,7 @@ def open_token_session(require_login: bool = False):
             "python-pkcs11 is not installed. Install dependencies from requirements.txt."
         ) from exc
 
-    cfg = Pkcs11Config.from_env()
+    cfg = Pkcs11Config.current()
     lib = pkcs11.lib(cfg.module)
 
     if cfg.slot_no is not None:
@@ -393,7 +509,7 @@ def pkcs11_mechanism(name: str):
 
 
 def configured_key_id() -> str:
-    cfg = Pkcs11Config.from_env()
+    cfg = Pkcs11Config.current()
     if cfg.key_id:
         return cfg.key_id.hex()
     if cfg.key_label:
@@ -425,6 +541,15 @@ def list_pkcs11_objects() -> list[dict[str, Any]]:
                 item = describe_pkcs11_object(obj, object_class_name)
                 objects.append(item)
     return objects
+
+
+def list_pkcs11_certificates() -> list[dict[str, Any]]:
+    certs: list[dict[str, Any]] = []
+    with open_token_session() as session:
+        criteria = {pkcs11_attribute("CLASS"): pkcs11_object_class("CERTIFICATE")}
+        for obj in list(session.get_objects(criteria)):
+            certs.append(describe_pkcs11_object(obj, "CERTIFICATE"))
+    return certs
 
 
 def describe_pkcs11_object(obj, object_class_name: str) -> dict[str, Any]:
@@ -469,9 +594,9 @@ def describe_certificate(cert_der: bytes) -> dict[str, str]:
 
 
 if __name__ == "__main__":
-    if len(os.sys.argv) > 1 and os.sys.argv[1] == "list-pkcs11":
-        import json
+    configure_interactively()
 
+    if len(os.sys.argv) > 1 and os.sys.argv[1] == "list-pkcs11":
         print(json.dumps(list_pkcs11_objects(), indent=2, ensure_ascii=False))
         raise SystemExit(0)
 

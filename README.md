@@ -31,29 +31,37 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Required:
+On startup, the service reads `config.json` from the current directory. If the
+file is missing, the PKCS#11 module cannot be loaded, or no certificate choice
+has been saved yet, it prompts on the console and writes the selected values
+back to `config.json`.
 
-```sh
-export ESIG_PKCS11_MODULE=/usr/local/AWP/lib/libOcsPKCS11Wrapper.so
+Example:
+
+```json
+{
+  "pkcs11_module": "/usr/lib/pkcs11/opensc-pkcs11.so",
+  "cert_label": "SIGNING CERTIFICATE LABEL",
+  "key_id": "0123456789abcdef"
+}
 ```
 
-Optional selectors. Leave these unset if the token exposes exactly one usable
-certificate/private key pair, which is how simple JSigPDF SunPKCS11 configs
-usually work.
+`config.json` is ignored by Git. See `config.example.json` for a template.
+
+Environment variables still override `config.json` for scripting:
 
 ```sh
-export ESIG_PKCS11_TOKEN_LABEL='token label'
-export ESIG_PKCS11_CERT_LABEL='certificate label'
-export ESIG_PKCS11_KEY_LABEL='private key label'
-export ESIG_PKCS11_PIN='123456'
+ESIG_PKCS11_MODULE
+ESIG_PKCS11_TOKEN_LABEL
+ESIG_PKCS11_CERT_LABEL
+ESIG_PKCS11_KEY_LABEL
+ESIG_PKCS11_KEY_ID
+ESIG_PKCS11_SLOT_NO
+ESIG_PKCS11_PIN
 ```
 
-Alternative slot selection:
-
-```sh
-export ESIG_PKCS11_SLOT_NO=0
-export ESIG_PKCS11_KEY_ID=0123456789abcdef
-```
+Do not put the PIN in `config.json`. If `ESIG_PKCS11_PIN` is unset, the service
+prompts for the PIN on the console for each signing request.
 
 Server:
 
@@ -65,7 +73,7 @@ export ESIG_PORT=9795
 ## Run
 
 ```sh
-python app.py
+python3 app.py
 ```
 
 Health check:
@@ -87,7 +95,7 @@ Then call `/rest/sign` with `toBeSigned.bytes` from the web application.
 To inspect visible token objects and choose labels/IDs:
 
 ```sh
-./run.sh list-pkcs11
+python3 app.py list-pkcs11
 ```
 
 Use the chosen certificate object's `label` as `ESIG_PKCS11_CERT_LABEL`.
