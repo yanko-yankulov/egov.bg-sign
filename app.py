@@ -55,7 +55,7 @@ class Pkcs11Config:
             raise ValueError("pkcs11_module is required in config.json")
 
         slot_no_raw = CONFIG.get("slot_no")
-        slot_no = int(slot_no_raw) if slot_no_raw else None
+        slot_no = int(slot_no_raw) if slot_no_raw is not None and slot_no_raw != "" else None
         key_id_raw = CONFIG.get("key_id")
         key_id = bytes.fromhex(key_id_raw.replace(":", "")) if key_id_raw else None
 
@@ -138,6 +138,21 @@ def configure_interactively() -> None:
         save_config(CONFIG)
         log(f"Saved PKCS#11 module to {CONFIG_PATH}")
 
+    tokens = list_pkcs11_tokens()
+    log(f"Found {len(tokens)} PKCS#11 token(s)")
+    if not tokens:
+        raise RuntimeError("No PKCS#11 tokens found")
+
+    selected_token = select_token(tokens)
+    CONFIG["slot_no"] = selected_token.get("slot_no")
+    CONFIG["token_label"] = selected_token.get("label") or None
+    CONFIG = {key: value for key, value in CONFIG.items() if value is not None}
+    save_config(CONFIG)
+    log(
+        "Using token "
+        f"slot_no={CONFIG.get('slot_no')} label={CONFIG.get('token_label') or '(no label)'}"
+    )
+
     certs = list_pkcs11_certificates()
     log(f"Found {len(certs)} certificate(s) on token")
     if not certs:
@@ -161,6 +176,48 @@ def module_loads(module: Any) -> bool:
         return True
     except Exception:
         return False
+
+
+def select_token(tokens: list[dict[str, Any]]) -> dict[str, Any]:
+    configured_slot_no = CONFIG.get("slot_no")
+    configured_label = CONFIG.get("token_label")
+
+    if configured_slot_no is not None and configured_slot_no != "":
+        try:
+            slot_no = int(configured_slot_no)
+        except (TypeError, ValueError):
+            slot_no = None
+        if slot_no is not None:
+            for token in tokens:
+                if token.get("slot_no") == slot_no:
+                    return token
+
+    if configured_label:
+        matching_tokens = [token for token in tokens if token.get("label") == configured_label]
+        if len(matching_tokens) == 1:
+            return matching_tokens[0]
+
+    if len(tokens) == 1:
+        return tokens[0]
+
+    print("Available PKCS#11 tokens:")
+    for index, token in enumerate(tokens, start=1):
+        label = token.get("label") or "(no label)"
+        serial = token.get("serial") or "(no serial)"
+        manufacturer = token.get("manufacturer") or "(unknown manufacturer)"
+        model = token.get("model") or "(unknown model)"
+        print(f"  {index}. slot {token.get('slot_no')}: {label}")
+        print(f"     serial: {serial}")
+        print(f"     {manufacturer} {model}")
+
+    while True:
+        choice = input(f"Choose token [1-{len(tokens)}]: ").strip()
+        try:
+            index = int(choice)
+        except ValueError:
+            continue
+        if 1 <= index <= len(tokens):
+            return tokens[index - 1]
 
 
 def select_certificate(certs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -543,10 +600,12 @@ def open_token_session(require_login: bool = False):
     lib = pkcs11.lib(cfg.module)
 
     if cfg.slot_no is not None:
-        slots = lib.get_slots(token_present=True)
+        slots = lib.get_slots()
         try:
             token = slots[cfg.slot_no].get_token()
         except IndexError as exc:
+            raise ValueError(f"No PKCS#11 token at slot index {cfg.slot_no}") from exc
+        except Exception as exc:
             raise ValueError(f"No PKCS#11 token at slot index {cfg.slot_no}") from exc
     elif cfg.token_label:
         token = lib.get_token(token_label=cfg.token_label)
@@ -602,6 +661,46 @@ def pkcs11_mechanism(name: str):
     import pkcs11
 
     return getattr(pkcs11.Mechanism, name)
+
+
+def list_pkcs11_tokens() -> list[dict[str, Any]]:
+    try:
+        import pkcs11
+    except ImportError as exc:
+        raise RuntimeError(
+            "python-pkcs11 is not installed. Install dependencies from requirements.txt."
+        ) from exc
+
+    module = CONFIG.get("pkcs11_module")
+    if not module:
+        raise ValueError("pkcs11_module is required in config.json")
+
+    lib = pkcs11.lib(str(module))
+    tokens: list[dict[str, Any]] = []
+    for slot_no, slot in enumerate(lib.get_slots()):
+        try:
+            token = slot.get_token()
+        except Exception:
+            continue
+        tokens.append(describe_pkcs11_token(token, slot_no))
+    return tokens
+
+
+def describe_pkcs11_token(token, slot_no: int) -> dict[str, Any]:
+    return {
+        "slot_no": slot_no,
+        "label": stripped_attr(token, "label"),
+        "manufacturer": stripped_attr(token, "manufacturer_id"),
+        "model": stripped_attr(token, "model"),
+        "serial": stripped_attr(token, "serial"),
+    }
+
+
+def stripped_attr(obj, name: str) -> str | None:
+    value = getattr(obj, name, None)
+    if value is None:
+        return None
+    return str(value).strip() or None
 
 
 def configured_key_id() -> str:

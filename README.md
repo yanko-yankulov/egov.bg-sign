@@ -43,6 +43,8 @@ Example:
 ```json
 {
   "pkcs11_module": "/usr/lib/pkcs11/opensc-pkcs11.so",
+  "slot_no": 0,
+  "token_label": "TOKEN LABEL",
   "cert_label": "SIGNING CERTIFICATE LABEL",
   "key_id": "0123456789abcdef",
   "host": "127.0.0.1",
@@ -103,8 +105,10 @@ python3 app.py list-pkcs11
 ```
 
 The startup wizard saves the chosen certificate object's `label` as
-`cert_label` and its hex `id` as `key_id`. If you need to tune the selection
-manually, edit those keys in `config.json`.
+`cert_label` and its hex `id` as `key_id`. If multiple PKCS#11 tokens are
+present, it also asks which token to use and saves `slot_no` plus
+`token_label`. If you need to tune the selection manually, edit those keys in
+`config.json`.
 
 ## Current limits
 
